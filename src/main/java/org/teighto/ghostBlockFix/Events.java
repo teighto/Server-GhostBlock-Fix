@@ -1,6 +1,8 @@
 package org.teighto.ghostBlockFix;
 
 import org.bukkit.Location;
+import org.bukkit.GameMode;
+import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Player;
@@ -20,6 +22,7 @@ import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.util.Vector;
 
 import java.util.Collection;
 import java.util.HashMap;
@@ -31,6 +34,7 @@ import java.util.UUID;
 public final class Events implements Listener {
 
     private static final long MOVE_SYNC_COOLDOWN_MS = 250L;
+    private static final long GHOST_STAND_FIX_COOLDOWN_MS = 180L;
     private static final long FALLBACK_SYNC_COOLDOWN_MS = 3_500L;
     private static final long DIRTY_CHUNK_TTL_MS = 8_000L;
     private static final long CLEANUP_INTERVAL_MS = 3_000L;
@@ -40,6 +44,8 @@ public final class Events implements Listener {
     private final Syncer syncer;
     private final Map<String, Long> dirtyChunks = new HashMap<>();
     private final Map<UUID, Long> lastMoveSyncAt = new HashMap<>();
+    private final Map<UUID, Long> lastGhostStandFixAt = new HashMap<>();
+    private final Map<UUID, Location> lastSafeLocations = new HashMap<>();
     private final Map<UUID, Set<Location>> pendingInteractLocations = new HashMap<>();
     private final Set<UUID> scheduledInteractSync = new HashSet<>();
     private final Map<UUID, Long> lastFallbackSyncAt = new HashMap<>();
@@ -124,23 +130,28 @@ public final class Events implements Listener {
     @EventHandler(priority = EventPriority.MONITOR)
     public void onJoin(PlayerJoinEvent event) {
         refreshSmallArea(event.getPlayer());
+        plugin.getServer().getScheduler().runTaskLater(plugin, () -> rememberSafeLocation(event.getPlayer()), 10L);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onRespawn(PlayerRespawnEvent event) {
         Player player = event.getPlayer();
         plugin.getServer().getScheduler().runTaskLater(plugin, () -> refreshSmallArea(player), 5L);
+        plugin.getServer().getScheduler().runTaskLater(plugin, () -> rememberSafeLocation(player), 10L);
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onTeleport(PlayerTeleportEvent event) {
         refreshSmallArea(event.getPlayer());
+        plugin.getServer().getScheduler().runTaskLater(plugin, () -> rememberSafeLocation(event.getPlayer()), 5L);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(PlayerQuitEvent event) {
         UUID playerId = event.getPlayer().getUniqueId();
         lastMoveSyncAt.remove(playerId);
+        lastGhostStandFixAt.remove(playerId);
+        lastSafeLocations.remove(playerId);
         pendingInteractLocations.remove(playerId);
         scheduledInteractSync.remove(playerId);
         lastFallbackSyncAt.remove(playerId);
@@ -154,9 +165,9 @@ public final class Events implements Listener {
             return;
         }
 
-        if (from.getBlockX() == to.getBlockX()
-            && from.getBlockY() == to.getBlockY()
-            && from.getBlockZ() == to.getBlockZ()) {
+        if (from.getX() == to.getX()
+            && from.getY() == to.getY()
+            && from.getZ() == to.getZ()) {
             return;
         }
 
@@ -165,6 +176,19 @@ public final class Events implements Listener {
 
         Player player = event.getPlayer();
         UUID playerId = player.getUniqueId();
+
+        if (hasRealSupport(to)) {
+            lastSafeLocations.put(playerId, to.clone());
+        } else if (fixGhostStanding(player, playerId, to, now)) {
+            return;
+        }
+
+        if (from.getBlockX() == to.getBlockX()
+            && from.getBlockY() == to.getBlockY()
+            && from.getBlockZ() == to.getBlockZ()) {
+            return;
+        }
+
         if (hasDirtyChunkNear(to, now)) {
             Long lastAt = lastMoveSyncAt.get(playerId);
             if (lastAt != null && now - lastAt < MOVE_SYNC_COOLDOWN_MS) {
@@ -251,6 +275,103 @@ public final class Events implements Listener {
         }, delay);
     }
 
+    private boolean fixGhostStanding(Player player, UUID playerId, Location location, long now) {
+        if (!player.isOnGround() || shouldSkipGroundFix(player, location)) {
+            return false;
+        }
+
+        Long lastAt = lastGhostStandFixAt.get(playerId);
+        if (lastAt != null && now - lastAt < GHOST_STAND_FIX_COOLDOWN_MS) {
+            return true;
+        }
+
+        lastGhostStandFixAt.put(playerId, now);
+        Set<Location> changed = supportLocations(location);
+        syncer.syncLocationsForPlayer(player, changed);
+
+        Location safe = lastSafeLocations.get(playerId);
+        if (safe != null && safe.getWorld() != null && safe.getWorld().equals(location.getWorld())) {
+            safe.setYaw(location.getYaw());
+            safe.setPitch(location.getPitch());
+            player.teleport(safe);
+            return true;
+        }
+
+        player.setVelocity(new Vector(0.0D, -0.45D, 0.0D));
+        return true;
+    }
+
+    private boolean shouldSkipGroundFix(Player player, Location location) {
+        GameMode gameMode = player.getGameMode();
+        if (gameMode == GameMode.CREATIVE || gameMode == GameMode.SPECTATOR) {
+            return true;
+        }
+
+        if (player.isFlying() || player.isInsideVehicle() || player.isGliding() || player.isSwimming()) {
+            return true;
+        }
+
+        Block current = location.getBlock();
+        Block below = current.getRelative(BlockFace.DOWN);
+        return current.isLiquid() || below.isLiquid();
+    }
+
+    private void rememberSafeLocation(Player player) {
+        if (player.isOnline() && hasRealSupport(player.getLocation())) {
+            lastSafeLocations.put(player.getUniqueId(), player.getLocation().clone());
+        }
+    }
+
+    private boolean hasRealSupport(Location location) {
+        World world = location.getWorld();
+        if (world == null) {
+            return true;
+        }
+
+        int y = (int) Math.floor(location.getY() - 0.08D);
+        if (y < world.getMinHeight() || y >= world.getMaxHeight()) {
+            return false;
+        }
+
+        double x = location.getX();
+        double z = location.getZ();
+
+        return isSupportBlock(world.getBlockAt((int) Math.floor(x), y, (int) Math.floor(z)))
+            || isSupportBlock(world.getBlockAt((int) Math.floor(x + 0.31D), y, (int) Math.floor(z + 0.31D)))
+            || isSupportBlock(world.getBlockAt((int) Math.floor(x + 0.31D), y, (int) Math.floor(z - 0.31D)))
+            || isSupportBlock(world.getBlockAt((int) Math.floor(x - 0.31D), y, (int) Math.floor(z + 0.31D)))
+            || isSupportBlock(world.getBlockAt((int) Math.floor(x - 0.31D), y, (int) Math.floor(z - 0.31D)));
+    }
+
+    private boolean isSupportBlock(Block block) {
+        return !block.isPassable();
+    }
+
+    private Set<Location> supportLocations(Location location) {
+        Set<Location> changed = new HashSet<>();
+        World world = location.getWorld();
+        if (world == null) {
+            return changed;
+        }
+
+        int baseX = location.getBlockX();
+        int baseY = (int) Math.floor(location.getY() - 0.08D);
+        int baseZ = location.getBlockZ();
+
+        int minY = world.getMinHeight();
+        int maxY = world.getMaxHeight() - 1;
+
+        for (int x = baseX - 1; x <= baseX + 1; x++) {
+            for (int y = Math.max(baseY - 1, minY); y <= Math.min(baseY + 2, maxY); y++) {
+                for (int z = baseZ - 1; z <= baseZ + 1; z++) {
+                    changed.add(new Location(world, x, y, z));
+                }
+            }
+        }
+
+        return changed;
+    }
+
     private void markDirty(Collection<Location> changed) {
         long now = System.currentTimeMillis();
         long dirtyUntil = now + DIRTY_CHUNK_TTL_MS;
@@ -307,6 +428,7 @@ public final class Events implements Listener {
         nextCleanupAt = now + CLEANUP_INTERVAL_MS;
         dirtyChunks.entrySet().removeIf(entry -> entry.getValue() < now);
         lastMoveSyncAt.entrySet().removeIf(entry -> now - entry.getValue() > PLAYER_STATE_TTL_MS);
+        lastGhostStandFixAt.entrySet().removeIf(entry -> now - entry.getValue() > PLAYER_STATE_TTL_MS);
         lastFallbackSyncAt.entrySet().removeIf(entry -> now - entry.getValue() > PLAYER_STATE_TTL_MS);
     }
 }
