@@ -22,6 +22,7 @@ import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.util.BoundingBox;
 import org.bukkit.util.Vector;
 
 import java.util.Collection;
@@ -36,6 +37,7 @@ public final class Events implements Listener {
     private static final long MOVE_SYNC_COOLDOWN_MS = 250L;
     private static final long GHOST_STAND_FIX_COOLDOWN_MS = 180L;
     private static final long FALLBACK_SYNC_COOLDOWN_MS = 3_500L;
+    private static final long SUSPECT_BLOCK_TTL_MS = 15_000L;
     private static final long DIRTY_CHUNK_TTL_MS = 8_000L;
     private static final long CLEANUP_INTERVAL_MS = 3_000L;
     private static final long PLAYER_STATE_TTL_MS = 60_000L;
@@ -47,6 +49,7 @@ public final class Events implements Listener {
     private final Map<UUID, Long> lastGhostStandFixAt = new HashMap<>();
     private final Map<UUID, Location> lastSafeLocations = new HashMap<>();
     private final Map<UUID, Set<Location>> pendingInteractLocations = new HashMap<>();
+    private final Map<UUID, Map<Location, Long>> suspectedGhostBlocks = new HashMap<>();
     private final Set<UUID> scheduledInteractSync = new HashSet<>();
     private final Map<UUID, Long> lastFallbackSyncAt = new HashMap<>();
     private long nextCleanupAt;
@@ -54,6 +57,7 @@ public final class Events implements Listener {
     public Events(JavaPlugin plugin, Syncer syncer) {
         this.plugin = plugin;
         this.syncer = syncer;
+        plugin.getServer().getScheduler().runTaskTimer(plugin, this::checkOnlinePlayers, 20L, 4L);
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -94,6 +98,7 @@ public final class Events implements Listener {
 
         if (event.isCancelled()) {
             changed.add(event.getBlockAgainst().getLocation());
+            markSuspect(event.getPlayer(), event.getBlockPlaced().getLocation());
             queuePersonalSync(event.getPlayer(), changed);
             return;
         }
@@ -123,6 +128,9 @@ public final class Events implements Listener {
         }
 
         Player player = event.getPlayer();
+        Block target = event.getClickedBlock().getRelative(event.getBlockFace());
+        markSuspect(player, target.getLocation());
+
         Set<Location> changed = locationsFromInteract(event.getClickedBlock(), event.getBlockFace());
         queuePersonalSync(player, changed);
     }
@@ -153,6 +161,7 @@ public final class Events implements Listener {
         lastGhostStandFixAt.remove(playerId);
         lastSafeLocations.remove(playerId);
         pendingInteractLocations.remove(playerId);
+        suspectedGhostBlocks.remove(playerId);
         scheduledInteractSync.remove(playerId);
         lastFallbackSyncAt.remove(playerId);
     }
@@ -177,7 +186,11 @@ public final class Events implements Listener {
         Player player = event.getPlayer();
         UUID playerId = player.getUniqueId();
 
-        if (hasRealSupport(to)) {
+        if (isStandingOnSuspect(playerId, to, now)) {
+            if (fixGhostStanding(player, playerId, to, now)) {
+                return;
+            }
+        } else if (hasRealSupport(to)) {
             lastSafeLocations.put(playerId, to.clone());
         } else if (fixGhostStanding(player, playerId, to, now)) {
             return;
@@ -275,6 +288,67 @@ public final class Events implements Listener {
         }, delay);
     }
 
+    private void markSuspect(Player player, Location location) {
+        UUID playerId = player.getUniqueId();
+        Location blockLocation = blockLocation(location);
+        suspectedGhostBlocks
+            .computeIfAbsent(playerId, key -> new HashMap<>())
+            .put(blockLocation, System.currentTimeMillis() + SUSPECT_BLOCK_TTL_MS);
+    }
+
+    private boolean isStandingOnSuspect(UUID playerId, Location location, long now) {
+        Map<Location, Long> blocks = suspectedGhostBlocks.get(playerId);
+        if (blocks == null || blocks.isEmpty() || location.getWorld() == null) {
+            return false;
+        }
+
+        int feetY = (int) Math.floor(location.getY() - 0.08D);
+        double x = location.getX();
+        double z = location.getZ();
+
+        return isSuspect(blocks, location.getWorld(), (int) Math.floor(x), feetY, (int) Math.floor(z), now)
+            || isSuspect(blocks, location.getWorld(), (int) Math.floor(x + 0.31D), feetY, (int) Math.floor(z + 0.31D), now)
+            || isSuspect(blocks, location.getWorld(), (int) Math.floor(x + 0.31D), feetY, (int) Math.floor(z - 0.31D), now)
+            || isSuspect(blocks, location.getWorld(), (int) Math.floor(x - 0.31D), feetY, (int) Math.floor(z + 0.31D), now)
+            || isSuspect(blocks, location.getWorld(), (int) Math.floor(x - 0.31D), feetY, (int) Math.floor(z - 0.31D), now);
+    }
+
+    private boolean isSuspect(Map<Location, Long> blocks, World world, int x, int y, int z, long now) {
+        Long until = blocks.get(new Location(world, x, y, z));
+        return until != null && until >= now;
+    }
+
+    private Location blockLocation(Location location) {
+        return new Location(
+            location.getWorld(),
+            location.getBlockX(),
+            location.getBlockY(),
+            location.getBlockZ()
+        );
+    }
+
+    private void checkOnlinePlayers() {
+        long now = System.currentTimeMillis();
+        cleanupState(now);
+
+        for (Player player : plugin.getServer().getOnlinePlayers()) {
+            UUID playerId = player.getUniqueId();
+            Location location = player.getLocation();
+
+            if (isStandingOnSuspect(playerId, location, now)) {
+                fixGhostStanding(player, playerId, location, now);
+                continue;
+            }
+
+            if (hasRealSupport(location)) {
+                lastSafeLocations.put(playerId, location.clone());
+                continue;
+            }
+
+            fixGhostStanding(player, playerId, location, now);
+        }
+    }
+
     private boolean fixGhostStanding(Player player, UUID playerId, Location location, long now) {
         if (!player.isOnGround() || shouldSkipGroundFix(player, location)) {
             return false;
@@ -298,6 +372,7 @@ public final class Events implements Listener {
         }
 
         player.setVelocity(new Vector(0.0D, -0.45D, 0.0D));
+        player.teleport(location.clone().add(0.0D, -0.35D, 0.0D));
         return true;
     }
 
@@ -328,19 +403,41 @@ public final class Events implements Listener {
             return true;
         }
 
-        int y = (int) Math.floor(location.getY() - 0.08D);
-        if (y < world.getMinHeight() || y >= world.getMaxHeight()) {
+        double feetY = location.getY();
+        if (feetY < world.getMinHeight() || feetY >= world.getMaxHeight()) {
             return false;
         }
 
         double x = location.getX();
         double z = location.getZ();
+        BoundingBox feetBox = new BoundingBox(
+            x - 0.3001D,
+            feetY - 0.0801D,
+            z - 0.3001D,
+            x + 0.3001D,
+            feetY + 0.0501D,
+            z + 0.3001D
+        );
 
-        return isSupportBlock(world.getBlockAt((int) Math.floor(x), y, (int) Math.floor(z)))
-            || isSupportBlock(world.getBlockAt((int) Math.floor(x + 0.31D), y, (int) Math.floor(z + 0.31D)))
-            || isSupportBlock(world.getBlockAt((int) Math.floor(x + 0.31D), y, (int) Math.floor(z - 0.31D)))
-            || isSupportBlock(world.getBlockAt((int) Math.floor(x - 0.31D), y, (int) Math.floor(z + 0.31D)))
-            || isSupportBlock(world.getBlockAt((int) Math.floor(x - 0.31D), y, (int) Math.floor(z - 0.31D)));
+        int minX = (int) Math.floor(feetBox.getMinX());
+        int maxX = (int) Math.floor(feetBox.getMaxX());
+        int minY = Math.max((int) Math.floor(feetBox.getMinY()), world.getMinHeight());
+        int maxY = Math.min((int) Math.floor(feetBox.getMaxY()), world.getMaxHeight() - 1);
+        int minZ = (int) Math.floor(feetBox.getMinZ());
+        int maxZ = (int) Math.floor(feetBox.getMaxZ());
+
+        for (int blockX = minX; blockX <= maxX; blockX++) {
+            for (int blockY = minY; blockY <= maxY; blockY++) {
+                for (int blockZ = minZ; blockZ <= maxZ; blockZ++) {
+                    Block block = world.getBlockAt(blockX, blockY, blockZ);
+                    if (isSupportBlock(block) && block.getBoundingBox().overlaps(feetBox)) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
     }
 
     private boolean isSupportBlock(Block block) {
@@ -427,6 +524,10 @@ public final class Events implements Listener {
 
         nextCleanupAt = now + CLEANUP_INTERVAL_MS;
         dirtyChunks.entrySet().removeIf(entry -> entry.getValue() < now);
+        suspectedGhostBlocks.entrySet().removeIf(entry -> {
+            entry.getValue().entrySet().removeIf(blockEntry -> blockEntry.getValue() < now);
+            return entry.getValue().isEmpty();
+        });
         lastMoveSyncAt.entrySet().removeIf(entry -> now - entry.getValue() > PLAYER_STATE_TTL_MS);
         lastGhostStandFixAt.entrySet().removeIf(entry -> now - entry.getValue() > PLAYER_STATE_TTL_MS);
         lastFallbackSyncAt.entrySet().removeIf(entry -> now - entry.getValue() > PLAYER_STATE_TTL_MS);
