@@ -68,6 +68,10 @@ public final class Syncer {
         syncPlayer(player, locations);
     }
 
+    public void syncLocationsForPlayer(Player player, Collection<Location> rawLocations) {
+        syncPlayer(player, normalize(rawLocations));
+    }
+
     public void runNextTick(Runnable runnable) {
         plugin.getServer().getScheduler().runTask(plugin, runnable);
     }

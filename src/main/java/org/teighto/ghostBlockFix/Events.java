@@ -2,19 +2,23 @@ package org.teighto.ghostBlockFix;
 
 import org.bukkit.Location;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPistonExtendEvent;
 import org.bukkit.event.block.BlockPistonRetractEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.Collection;
@@ -36,6 +40,8 @@ public final class Events implements Listener {
     private final Syncer syncer;
     private final Map<String, Long> dirtyChunks = new HashMap<>();
     private final Map<UUID, Long> lastMoveSyncAt = new HashMap<>();
+    private final Map<UUID, Set<Location>> pendingInteractLocations = new HashMap<>();
+    private final Set<UUID> scheduledInteractSync = new HashSet<>();
     private final Map<UUID, Long> lastFallbackSyncAt = new HashMap<>();
     private long nextCleanupAt;
 
@@ -74,11 +80,18 @@ public final class Events implements Listener {
         resyncAround(changed, 40.0D);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.MONITOR)
     public void onBlockPlace(BlockPlaceEvent event) {
         Set<Location> changed = new HashSet<>();
         changed.add(event.getBlockPlaced().getLocation());
         addNeighbours(changed, event.getBlockPlaced().getLocation());
+
+        if (event.isCancelled()) {
+            changed.add(event.getBlockAgainst().getLocation());
+            queuePersonalSync(event.getPlayer(), changed);
+            return;
+        }
+
         markDirty(changed);
         resyncAround(changed, 32.0D);
     }
@@ -90,6 +103,22 @@ public final class Events implements Listener {
         addNeighbours(changed, event.getBlock().getLocation());
         markDirty(changed);
         resyncAround(changed, 32.0D);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onInteract(PlayerInteractEvent event) {
+        if (event.getAction() != Action.RIGHT_CLICK_BLOCK || event.getClickedBlock() == null) {
+            return;
+        }
+
+        ItemStack item = event.getItem();
+        if (item == null || !item.getType().isBlock()) {
+            return;
+        }
+
+        Player player = event.getPlayer();
+        Set<Location> changed = locationsFromInteract(event.getClickedBlock(), event.getBlockFace());
+        queuePersonalSync(player, changed);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -112,6 +141,8 @@ public final class Events implements Listener {
     public void onQuit(PlayerQuitEvent event) {
         UUID playerId = event.getPlayer().getUniqueId();
         lastMoveSyncAt.remove(playerId);
+        pendingInteractLocations.remove(playerId);
+        scheduledInteractSync.remove(playerId);
         lastFallbackSyncAt.remove(playerId);
     }
 
@@ -177,6 +208,47 @@ public final class Events implements Listener {
         target.add(new Location(center.getWorld(), x, y - 1, z));
         target.add(new Location(center.getWorld(), x, y, z + 1));
         target.add(new Location(center.getWorld(), x, y, z - 1));
+    }
+
+    private Set<Location> locationsFromInteract(Block clickedBlock, BlockFace face) {
+        Set<Location> changed = new HashSet<>();
+        Location clicked = clickedBlock.getLocation();
+        changed.add(clicked);
+
+        Block target = clickedBlock.getRelative(face);
+        Location targetLocation = target.getLocation();
+        changed.add(targetLocation);
+        addNeighbours(changed, targetLocation);
+
+        return changed;
+    }
+
+    private void queuePersonalSync(Player player, Collection<Location> changed) {
+        UUID playerId = player.getUniqueId();
+        pendingInteractLocations.computeIfAbsent(playerId, key -> new HashSet<>()).addAll(changed);
+
+        if (!scheduledInteractSync.add(playerId)) {
+            return;
+        }
+
+        schedulePersonalSync(player, playerId, 1L, false);
+        schedulePersonalSync(player, playerId, 3L, false);
+        schedulePersonalSync(player, playerId, 6L, false);
+        schedulePersonalSync(player, playerId, 10L, true);
+    }
+
+    private void schedulePersonalSync(Player player, UUID playerId, long delay, boolean finish) {
+        plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
+            Set<Location> pending = pendingInteractLocations.get(playerId);
+            if (pending != null && !pending.isEmpty() && player.isOnline()) {
+                syncer.syncLocationsForPlayer(player, new HashSet<>(pending));
+            }
+
+            if (finish) {
+                pendingInteractLocations.remove(playerId);
+                scheduledInteractSync.remove(playerId);
+            }
+        }, delay);
     }
 
     private void markDirty(Collection<Location> changed) {
